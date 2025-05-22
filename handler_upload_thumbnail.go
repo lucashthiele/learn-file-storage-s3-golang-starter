@@ -2,36 +2,83 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
 
-func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Request) {
-	videoIDString := r.PathValue("videoID")
+const MAX_MEMORY int64 = 10 << 20 // 10485760 bytes - 10MB
+const FORM_FILE_KEY string = "thumbnail"
+
+func (cfg *apiConfig) handlerUploadThumbnail(resp http.ResponseWriter, req *http.Request) {
+	videoIDString := req.PathValue("videoID")
 	videoID, err := uuid.Parse(videoIDString)
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid ID", err)
+		respondWithError(resp, http.StatusBadRequest, "Invalid ID", err)
 		return
 	}
 
-	token, err := auth.GetBearerToken(r.Header)
+	token, err := auth.GetBearerToken(req.Header)
 	if err != nil {
-		respondWithError(w, http.StatusUnauthorized, "Couldn't find JWT", err)
+		respondWithError(resp, http.StatusUnauthorized, "Couldn't find JWT", err)
 		return
 	}
 
 	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
 	if err != nil {
-		respondWithError(w, http.StatusUnauthorized, "Couldn't validate JWT", err)
+		respondWithError(resp, http.StatusUnauthorized, "Couldn't validate JWT", err)
 		return
 	}
 
-
 	fmt.Println("uploading thumbnail for video", videoID, "by user", userID)
 
-	// TODO: implement the upload here
+	err = req.ParseMultipartForm(MAX_MEMORY)
+	if err != nil {
+		respondWithError(resp, http.StatusBadRequest, "Couldn't parse multipart form", err)
+		return
+	}
 
-	respondWithJSON(w, http.StatusOK, struct{}{})
+	file, headers, err := req.FormFile(FORM_FILE_KEY)
+	if err != nil {
+		respondWithError(resp, http.StatusBadRequest, "Couldn't get file", err)
+		return
+	}
+
+	contentType := headers.Header.Get("Content-Type")
+
+	imageData, err := io.ReadAll(file)
+	if err != nil {
+		respondWithError(resp, http.StatusBadRequest, "Couldn't read image", err)
+		return
+	}
+
+	video, err := cfg.db.GetVideo(videoID)
+	if err != nil {
+		respondWithError(resp, http.StatusInternalServerError, "Couldn't get video from db", err)
+		return
+	}
+
+	if video.UserID != userID {
+		respondWithError(resp, http.StatusUnauthorized, "User is not the owner of the video", err)
+		return
+	}
+
+	videoThumbnails[videoID] = thumbnail{
+		data:      imageData,
+		mediaType: contentType,
+	}
+
+	thumbnailURL := fmt.Sprintf("http://localhost:%s/api/thumbnails/%s", cfg.port, videoID)
+
+	video.ThumbnailURL = &thumbnailURL
+
+	err = cfg.db.UpdateVideo(video)
+	if err != nil {
+		respondWithError(resp, http.StatusInternalServerError, "Couldn't update video in db", err)
+		return
+	}
+
+	respondWithJSON(resp, http.StatusOK, video)
 }
