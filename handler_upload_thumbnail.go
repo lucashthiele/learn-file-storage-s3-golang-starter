@@ -1,10 +1,13 @@
 package main
 
 import (
-	"encoding/base64"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -12,6 +15,36 @@ import (
 
 const MAX_MEMORY int64 = 10 << 20 // 10485760 bytes - 10MB
 const FORM_FILE_KEY string = "thumbnail"
+
+func getFilename(contentType string, videoID uuid.UUID) (string, string) {
+	fileExtension := strings.Split(contentType, "/")[1]
+	filename := fmt.Sprintf("%s.%s", videoID.String(), fileExtension)
+	return fileExtension, filename
+}
+
+func createFile(cfg *apiConfig, filename string) (*os.File, error) {
+	imagePath := filepath.Join(cfg.assetsRoot, filename)
+	imageFile, err := os.Create(imagePath)
+	return imageFile, err
+}
+
+func getThumbnailURL(port, videoID, fileExtension string) *string {
+	thumbnailURL := fmt.Sprintf("http://localhost:%s/assets/%s.%s", port, videoID, fileExtension)
+	return &thumbnailURL
+}
+
+func validateContentType(contentType string) (string, error) {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return "", err
+	}
+
+	if mediaType != "image/jpeg" && mediaType != "image/png" {
+		return "", fmt.Errorf("media type %s not supported", mediaType)
+	}
+
+	return mediaType, nil
+}
 
 func (cfg *apiConfig) handlerUploadThumbnail(resp http.ResponseWriter, req *http.Request) {
 	videoIDString := req.PathValue("videoID")
@@ -41,17 +74,9 @@ func (cfg *apiConfig) handlerUploadThumbnail(resp http.ResponseWriter, req *http
 		return
 	}
 
-	file, headers, err := req.FormFile(FORM_FILE_KEY)
+	reqFile, headers, err := req.FormFile(FORM_FILE_KEY)
 	if err != nil {
 		respondWithError(resp, http.StatusBadRequest, "Couldn't get file", err)
-		return
-	}
-
-	contentType := headers.Header.Get("Content-Type")
-
-	imageData, err := io.ReadAll(file)
-	if err != nil {
-		respondWithError(resp, http.StatusBadRequest, "Couldn't read image", err)
 		return
 	}
 
@@ -66,11 +91,28 @@ func (cfg *apiConfig) handlerUploadThumbnail(resp http.ResponseWriter, req *http
 		return
 	}
 
-	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
+	contentType := headers.Header.Get("Content-Type")
+	mediaType, err := validateContentType(contentType)
+	if err != nil {
+		respondWithError(resp, http.StatusUnsupportedMediaType, err.Error(), err)
+		return
+	}
 
-	thumbnailURL := fmt.Sprintf("data:%s;base64,%s", contentType, imageBase64)
+	fileExtension, filename := getFilename(mediaType, videoID)
 
-	video.ThumbnailURL = &thumbnailURL
+	imageFile, err := createFile(cfg, filename)
+	if err != nil {
+		respondWithError(resp, http.StatusInternalServerError, "Couldn't create image file", err)
+		return
+	}
+
+	_, err = io.Copy(imageFile, reqFile)
+	if err != nil {
+		respondWithError(resp, http.StatusInternalServerError, "Couldn't create image file", err)
+		return
+	}
+
+	video.ThumbnailURL = getThumbnailURL(cfg.port, video.ID.String(), fileExtension)
 
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
